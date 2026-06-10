@@ -164,7 +164,9 @@ class VideoCompressor {
             return 30
         }
 
-        return min(max(nominalFrameRate, 1), 30)
+        // Cap at 60 fps. 30 fps cap silently halved 60 fps recordings and
+        // produced visibly choppy output.
+        return min(max(nominalFrameRate, 1), 60)
     }
 
     func scaledDimensions(width: CGFloat, height: CGFloat, maxSize: CGFloat) -> (width: Int, height: Int) {
@@ -193,26 +195,32 @@ class VideoCompressor {
         targetHeight: Int,
         targetFrameRate: Int
     ) -> Int {
+        // WhatsApp-style bitrate envelope. The previous floors/ceilings were
+        // ~2-3x larger and produced "compressed" outputs that were still
+        // 20-40 MB for short clips. These bands target ~1.5 Mbps at 720p,
+        // matching WhatsApp's typical output size while keeping visual
+        // quality acceptable for chat playback. Must stay in sync with
+        // VideoCompressionProfile.kt on Android.
         let targetLongSide = max(targetWidth, targetHeight)
         let floor: Int
         let ceiling: Int
 
         switch targetLongSide {
         case 1920...:
-            floor = 4_000_000
-            ceiling = 8_000_000
-        case 1280...1919:
-            floor = 2_200_000
-            ceiling = 5_000_000
-        case 960...1279:
-            floor = 1_600_000
+            floor = 2_000_000
             ceiling = 3_500_000
-        case 720...959:
+        case 1280...1919:
             floor = 1_200_000
-            ceiling = 2_500_000
-        default:
-            floor = 850_000
+            ceiling = 2_000_000
+        case 960...1279:
+            floor = 900_000
             ceiling = 1_500_000
+        case 720...959:
+            floor = 700_000
+            ceiling = 1_200_000
+        default:
+            floor = 500_000
+            ceiling = 900_000
         }
 
         guard originalBitrate > 0 else {
@@ -312,11 +320,15 @@ class VideoCompressor {
         exporter.outputURL = tmpURL
         exporter.outputFileType = AVFileType.mp4
 
+        // NOTE: Do not add AVVideoExpectedSourceFrameRateKey or
+        // AVVideoAverageNonDroppableFrameRateKey here. They are not documented
+        // H.264 (avc1) compression properties on iOS and, while AVFoundation's
+        // `canApply(...)` check still returns true, the iOS encoder silently
+        // drops the video track, producing an audio-only MP4 that still reports
+        // success. See issue #400.
         let compressionDict: [String: Any] = [
           AVVideoAverageBitRateKey: bitRate,
           AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-          AVVideoExpectedSourceFrameRateKey: frameRate,
-          AVVideoAverageNonDroppableFrameRateKey: frameRate,
         ]
         exporter.optimizeForNetworkUse = true;
         exporter.videoOutputConfiguration = [
@@ -336,6 +348,14 @@ class VideoCompressor {
             ]
         }
 
+        // Preserve source metadata (location, creation date, etc.) by forwarding
+        // every available metadata format to the writer.
+        var preservedMetadata: [AVMetadataItem] = asset.metadata
+        for format in asset.availableMetadataFormats {
+            preservedMetadata.append(contentsOf: asset.metadata(forFormat: format))
+        }
+        exporter.metadata = preservedMetadata
+
         compressorExports[uuid] = exporter
         exporter.export(progressHandler: { (progress) in
             let roundProgress:Int=Int((progress*100).rounded());
@@ -350,7 +370,16 @@ class VideoCompressor {
             switch result {
             case .success:
               if let outputURL = exporter.outputURL {
-                onCompletion(outputURL)
+                // Guard against the iOS encoder silently dropping the video track
+                // and producing an audio-only file that still reports success.
+                // See issue #400.
+                let outputAsset = AVAsset(url: outputURL)
+                if outputAsset.tracks(withMediaType: AVMediaType.video).isEmpty {
+                  try? FileManager.default.removeItem(at: outputURL)
+                  onFailure(CompressionError(message: "Compression produced a file with no video track"))
+                } else {
+                  onCompletion(outputURL)
+                }
               } else {
                 onFailure(CompressionError(message: "Compression succeeded but output URL is unavailable"))
               }

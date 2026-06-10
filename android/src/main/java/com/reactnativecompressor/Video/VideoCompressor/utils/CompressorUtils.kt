@@ -49,16 +49,19 @@ object CompressorUtils {
   }
 
   /**
-   * Set up an Mp4Movie with rotation and cache file.
+   * Set up an Mp4Movie with rotation, cache file and optional ISO 6709
+   * location string forwarded from the source video.
    */
   fun setUpMP4Movie(
     rotation: Int,
     cacheFile: File,
+    location: String? = null,
   ): Mp4Movie {
     val movie = Mp4Movie()
     movie.apply {
       setCacheFile(cacheFile)
       setRotation(rotation)
+      setLocation(location)
     }
     return movie
   }
@@ -71,6 +74,7 @@ object CompressorUtils {
     outputFormat: MediaFormat,
     newBitrate: Int,
     targetFrameRate: Int,
+    applyThroughputTuning: Boolean = true,
   ) {
     val newFrameRate = targetFrameRate.coerceAtLeast(1)
     val iFrameInterval = getIFrameIntervalRate(inputFormat)
@@ -84,10 +88,25 @@ object CompressorUtils {
       setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
       // Bitrate in bits per second
       setInteger(MediaFormat.KEY_BIT_RATE, newBitrate)
-      setInteger(
-        MediaFormat.KEY_BITRATE_MODE,
-        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-      )
+
+      // Throughput tuning. Some encoders reject these keys at configure() time,
+      // so the caller drops them (applyThroughputTuning = false) and reconfigures
+      // with default rate control on a fallback pass — see Compressor.prepareEncoder.
+      if (applyThroughputTuning) {
+        // VBR transcodes ~10-20% faster than CBR by skipping rate-control overhead
+        // on low-motion frames; quality stays equivalent for short-form video.
+        setInteger(
+          MediaFormat.KEY_BITRATE_MODE,
+          MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+        )
+        // Hint the hardware codec to run as fast as it can (not throttled to
+        // realtime playback) and at the highest scheduling priority. These keys
+        // unlock full throughput on Qualcomm / Exynos / MTK SoCs that accept them.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+          setInteger(MediaFormat.KEY_PRIORITY, 0)
+          setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+        }
+      }
 
       getColorStandard(inputFormat)?.let {
         setInteger(MediaFormat.KEY_COLOR_STANDARD, it)
@@ -187,5 +206,77 @@ object CompressorUtils {
       }
     }
     return false
+  }
+
+  // MIME type reported by MediaExtractor for Dolby Vision tracks (e.g. iPhone .MOV files)
+  private const val MIMETYPE_VIDEO_DOLBY_VISION = "video/dolby-vision"
+
+  /**
+   * Check whether the device exposes a decoder for the given MIME type.
+   */
+  private fun hasDecoderForMime(mime: String): Boolean {
+    val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+    for (codec in codecList.codecInfos) {
+      if (codec.isEncoder) continue
+      for (type in codec.supportedTypes) {
+        if (type.equals(mime, ignoreCase = true)) return true
+      }
+    }
+    return false
+  }
+
+  /**
+   * Resolve the backward-compatible base-layer MIME type for a Dolby Vision track.
+   *
+   * Dolby Vision profiles 8.x (DvheSt) and 4 (DvheDtr) carry an HEVC base layer, and
+   * profile 9 (DvavSe) carries an AVC base layer; these can be decoded by the standard
+   * HEVC/AVC decoders. Profiles 5 (DvheStn) and 7 (DvheDtb) have no usable single base
+   * layer, so they return null. When the profile is unknown we assume HEVC, which covers
+   * the common consumer case (e.g. iPhone records Dolby Vision profile 8).
+   */
+  private fun dolbyVisionBaseLayerMime(inputFormat: MediaFormat): String? {
+    if (!inputFormat.containsKey(MediaFormat.KEY_PROFILE)) {
+      return MediaFormat.MIMETYPE_VIDEO_HEVC
+    }
+    return when (inputFormat.getInteger(MediaFormat.KEY_PROFILE)) {
+      MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvavSe -> MediaFormat.MIMETYPE_VIDEO_AVC
+      MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheSt,
+      MediaCodecInfo.CodecProfileLevel.DolbyVisionProfileDvheDtr -> MediaFormat.MIMETYPE_VIDEO_HEVC
+      else -> null
+    }
+  }
+
+  /**
+   * Ensure the input video format can be decoded on this device.
+   *
+   * Some containers (notably iPhone `.MOV` files) expose the video track as
+   * `video/dolby-vision`. Many Android devices have no Dolby Vision decoder, so
+   * `MediaCodec.createDecoderByType("video/dolby-vision")` fails with NAME_NOT_FOUND.
+   * When the dedicated decoder is missing but the stream carries a backward-compatible
+   * base layer, this rewrites the format MIME to the base-layer codec so the standard
+   * HEVC/AVC decoder can decode it. If no compatible decoder exists, it throws a clear
+   * error instead of letting the cryptic native failure surface (see issue #398).
+   */
+  fun ensureDecodableVideoFormat(inputFormat: MediaFormat) {
+    val mime = inputFormat.getString(MediaFormat.KEY_MIME) ?: return
+    if (hasDecoderForMime(mime)) return
+
+    if (mime.equals(MIMETYPE_VIDEO_DOLBY_VISION, ignoreCase = true)) {
+      val fallbackMime = dolbyVisionBaseLayerMime(inputFormat)
+      if (fallbackMime != null && hasDecoderForMime(fallbackMime)) {
+        Log.w(
+          "Compressor",
+          "No Dolby Vision decoder on this device; decoding the $fallbackMime base layer instead."
+        )
+        inputFormat.setString(MediaFormat.KEY_MIME, fallbackMime)
+        return
+      }
+      throw IllegalStateException(
+        "This video uses Dolby Vision, which is not supported by this device's decoders " +
+          "and has no backward-compatible base layer to fall back to."
+      )
+    }
+
+    throw IllegalStateException("No decoder available for video format: $mime")
   }
 }
